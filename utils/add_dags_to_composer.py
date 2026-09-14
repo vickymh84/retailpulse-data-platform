@@ -9,7 +9,7 @@ import tempfile
 from google.cloud import storage
 
 
-def _create_dags_list(dags_directory: str):
+def _create_dags_list(dags_directory: str) -> tuple[str, list[str]]:
     temp_dir = tempfile.mkdtemp()
 
     files_to_ignore = ignore_patterns(
@@ -26,7 +26,7 @@ def _create_dags_list(dags_directory: str):
 
     dags = glob.glob(f"{temp_dir}/*.py")
 
-    return temp_dir, dags
+    return (temp_dir, dags)
 
 
 def upload_dags_to_composer(
@@ -37,38 +37,44 @@ def upload_dags_to_composer(
 
     temp_dir, dags = _create_dags_list(dags_directory)
 
-    if len(dags) == 0:
+    if len(dags) > 0:
+
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+
+        for dag in dags:
+
+            dag = dag.replace(
+                f"{temp_dir}/",
+                name_replacement,
+            )
+
+            try:
+
+                blob = bucket.blob(dag)
+
+                blob.upload_from_filename(dag)
+
+                print(
+                    f"File {dag} uploaded to "
+                    f"{bucket_name}/{dag}."
+                )
+
+            except FileNotFoundError:
+
+                current_directory = os.listdir()
+
+                print(
+                    f"{name_replacement} directory not found "
+                    f"in {current_directory}, "
+                    f"you may need to override the default "
+                    f"value of name_replacement."
+                )
+
+                raise
+
+    else:
         print("No DAGs to upload.")
-        return
-
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-
-    for dag in dags:
-
-        dag = dag.replace(
-            f"{temp_dir}/",
-            name_replacement,
-        )
-
-        try:
-            blob = bucket.blob(dag)
-            blob.upload_from_filename(dag)
-
-            print(
-                f"File {dag} uploaded to "
-                f"{bucket_name}/{dag}."
-            )
-
-        except FileNotFoundError:
-            current_directory = os.listdir()
-
-            print(
-                f"DAG directory not found. "
-                f"Current directory: {current_directory}"
-            )
-
-            raise
 
 
 if __name__ == "__main__":
@@ -77,12 +83,12 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--dags_directory",
-        required=True,
+        help="Relative path to the source directory containing your DAGs",
     )
 
     parser.add_argument(
         "--dags_bucket",
-        required=True,
+        help="Name of the DAGs bucket of your Composer environment without the gs:// prefix",
     )
 
     args = parser.parse_args()
