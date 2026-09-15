@@ -9,8 +9,8 @@ from airflow.providers.google.cloud.operators.dataflow import (
 
 PROJECT_ID = "retailpulse-lab-poc"
 REGION = "asia-south1"
-
 DATA_BUCKET = "ecommerce-data-bt"
+
 AUDIT_TABLE = (
     f"{PROJECT_ID}.ecommerce_bronze.ingestion_audit"
 )
@@ -19,6 +19,30 @@ DATAFLOW_TEMPLATE = (
     f"gs://dataflow-templates-{REGION}/latest/"
     "GCS_CSV_to_BigQuery"
 )
+
+
+ENTITY_CONFIG = {
+    "users": {
+        "schema": "raw_users_schema.json",
+        "table": "raw_users",
+        "bad_table": "bad_users",
+    },
+    "products": {
+        "schema": "raw_products_schema.json",
+        "table": "raw_products",
+        "bad_table": "bad_products",
+    },
+    "orders": {
+        "schema": "raw_orders_schema.json",
+        "table": "raw_orders",
+        "bad_table": "bad_orders",
+    },
+    "order_items": {
+        "schema": "raw_order_items_schema.json",
+        "table": "raw_order_items",
+        "bad_table": "bad_order_items",
+    },
+}
 
 
 with DAG(
@@ -31,12 +55,6 @@ with DAG(
 
     @task
     def check_new_files():
-        """
-        Check GCS for CSV files that have not already
-        been successfully processed.
-
-        This is the first stage of file-level idempotency.
-        """
 
         from google.cloud import storage
         from google.cloud import bigquery
@@ -62,16 +80,9 @@ with DAG(
             for row in bq_client.query(query).result()
         }
 
-        entities = [
-            "users",
-            "products",
-            "orders",
-            "order_items",
-        ]
+        new_files = []
 
-        new_files = {}
-
-        for entity in entities:
+        for entity, config in ENTITY_CONFIG.items():
 
             prefix = f"incoming/{entity}/"
 
@@ -79,8 +90,6 @@ with DAG(
                 bucket,
                 prefix=prefix,
             )
-
-            files = []
 
             for blob in blobs:
 
@@ -91,10 +100,30 @@ with DAG(
                     f"gs://{DATA_BUCKET}/{blob.name}"
                 )
 
-                if file_path not in processed_files:
-                    files.append(file_path)
+                if file_path in processed_files:
+                    continue
 
-            new_files[entity] = files
+                new_files.append(
+                    {
+                        "entity": entity,
+                        "file_path": file_path,
+                        "file_name": blob.name.split("/")[-1],
+                        "schema": (
+                            f"gs://{DATA_BUCKET}/schema/"
+                            f"{config['schema']}"
+                        ),
+                        "output_table": (
+                            f"{PROJECT_ID}:"
+                            f"ecommerce_bronze."
+                            f"{config['table']}"
+                        ),
+                        "bad_records_table": (
+                            f"{PROJECT_ID}:"
+                            f"ecommerce_bronze."
+                            f"{config['bad_table']}"
+                        ),
+                    }
+                )
 
         print(
             f"New files discovered: {new_files}"
@@ -106,20 +135,30 @@ with DAG(
     new_files = check_new_files()
 
 
-    @task
-    def show_new_files(files):
-        """
-        Display discovered files in the Airflow logs.
-        """
+    run_dataflow = DataflowTemplatedJobStartOperator.partial(
+        task_id="run_dataflow",
+        project_id=PROJECT_ID,
+        location=REGION,
+        template=DATAFLOW_TEMPLATE,
+        wait_until_finished=True,
+    ).expand(
+        parameters=new_files.map(
+            lambda file: {
+                "inputFilePattern": file["file_path"],
+                "schemaJSONPath": file["schema"],
+                "outputTable": file["output_table"],
+                "bigQueryLoadingTemporaryDirectory": (
+                    f"gs://{DATA_BUCKET}/temp"
+                ),
+                "badRecordsOutputTable": (
+                    file["bad_records_table"]
+                ),
+                "delimiter": ",",
+                "csvFormat": "Default",
+                "containsHeaders": "true",
+                "csvFileEncoding": "UTF-8",
+            }
+        )
+    )
 
-        print("Files selected for ingestion:")
-
-        for entity, paths in files.items():
-
-            print(f"\n{entity}:")
-
-            for path in paths:
-                print(f"  {path}")
-
-
-    show_files = show_new_files(new_files)
+    check_new_files() >> run_dataflow
