@@ -10,6 +10,10 @@ from airflow.providers.google.cloud.operators.dataflow import (
 )
 
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 PROJECT_ID = "retailpulse-lab-poc"
 REGION = "asia-south1"
 
@@ -25,22 +29,29 @@ DATAFLOW_TEMPLATE = (
 )
 
 
+# ============================================================
+# ENTITY CONFIGURATION
+# ============================================================
+
 ENTITY_CONFIG = {
     "users": {
         "schema": "raw_users_schema.json",
         "table": "raw_users",
         "bad_table": "bad_users",
     },
+
     "products": {
         "schema": "raw_products_schema.json",
         "table": "raw_products",
         "bad_table": "bad_products",
     },
+
     "orders": {
         "schema": "raw_orders_schema.json",
         "table": "raw_orders",
         "bad_table": "bad_orders",
     },
+
     "order_items": {
         "schema": "raw_order_items_schema.json",
         "table": "raw_order_items",
@@ -49,18 +60,35 @@ ENTITY_CONFIG = {
 }
 
 
+# ============================================================
+# DAG
+# ============================================================
+
 with DAG(
     dag_id="retailpulse_batch_pipeline",
-    start_date=datetime(2026, 9, 1),
+
+    start_date=datetime(
+        2026,
+        9,
+        1
+    ),
+
     schedule=None,
+
     catchup=False,
+
     max_active_runs=1,
+
     tags=[
         "retailpulse",
         "batch",
         "gcp",
     ],
 ) as dag:
+
+    # ========================================================
+    # 1. DISCOVER NEW FILES
+    # ========================================================
 
     @task
     def check_new_files():
@@ -76,9 +104,9 @@ with DAG(
             project=PROJECT_ID
         )
 
-        # --------------------------------------------------
-        # Find files already processed successfully
-        # --------------------------------------------------
+        # ----------------------------------------------------
+        # Get successfully processed files
+        # ----------------------------------------------------
 
         query = f"""
         SELECT DISTINCT file_path
@@ -91,19 +119,31 @@ with DAG(
             for row in bq_client.query(query).result()
         }
 
-        # --------------------------------------------------
-        # Discover new CSV files
-        # --------------------------------------------------
+        print(
+            f"Already processed files: "
+            f"{len(processed_files)}"
+        )
+
+        # ----------------------------------------------------
+        # Discover new files
+        # ----------------------------------------------------
 
         dataflow_jobs = []
 
         run_timestamp = datetime.now(
             timezone.utc
-        ).strftime("%Y%m%d%H%M%S")
+        ).strftime(
+            "%Y%m%d%H%M%S"
+        )
 
         for entity, config in ENTITY_CONFIG.items():
 
             prefix = f"incoming/{entity}/"
+
+            print(
+                f"Scanning: "
+                f"gs://{DATA_BUCKET}/{prefix}"
+            )
 
             blobs = storage_client.list_blobs(
                 DATA_BUCKET,
@@ -112,7 +152,7 @@ with DAG(
 
             for blob in blobs:
 
-                # Only process CSV files
+                # Only CSV files
                 if not blob.name.endswith(".csv"):
                     continue
 
@@ -120,13 +160,22 @@ with DAG(
                     f"gs://{DATA_BUCKET}/{blob.name}"
                 )
 
-                # Skip files already processed
+                # ------------------------------------------------
+                # Skip successfully processed files
+                # ------------------------------------------------
+
                 if file_path in processed_files:
+
+                    print(
+                        f"SKIP already processed: "
+                        f"{file_path}"
+                    )
+
                     continue
 
-                # --------------------------------------------------
+                # ------------------------------------------------
                 # Create unique Dataflow job name
-                # --------------------------------------------------
+                # ------------------------------------------------
 
                 file_hash = hashlib.md5(
                     file_path.encode("utf-8")
@@ -138,89 +187,115 @@ with DAG(
                     f"{file_hash}"
                 )
 
+                # Dataflow job names must be safe
                 job_name = re.sub(
                     r"[^a-z0-9-]",
                     "-",
                     job_name.lower(),
                 )
 
-                # --------------------------------------------------
-                # Dataflow job definition
-                # --------------------------------------------------
+                # ------------------------------------------------
+                # Build Dataflow parameters
+                # ------------------------------------------------
+
+                dataflow_job = {
+                    "job_name": job_name,
+
+                    "parameters": {
+
+                        "inputFilePattern": (
+                            file_path
+                        ),
+
+                        "schemaJSONPath": (
+                            f"gs://{DATA_BUCKET}/schema/"
+                            f"{config['schema']}"
+                        ),
+
+                        "outputTable": (
+                            f"{PROJECT_ID}:"
+                            f"ecommerce_bronze."
+                            f"{config['table']}"
+                        ),
+
+                        "bigQueryLoadingTemporaryDirectory": (
+                            f"gs://{DATA_BUCKET}/temp/"
+                        ),
+
+                        "badRecordsOutputTable": (
+                            f"{PROJECT_ID}:"
+                            f"ecommerce_bronze."
+                            f"{config['bad_table']}"
+                        ),
+
+                        "delimiter": ",",
+
+                        "csvFormat": "Default",
+
+                        "containsHeaders": "true",
+                    },
+                }
 
                 dataflow_jobs.append(
-                    {
-                        "job_name": job_name,
-
-                        "parameters": {
-
-                            "inputFilePattern": file_path,
-
-                            "schemaJSONPath": (
-                                f"gs://{DATA_BUCKET}/schema/"
-                                f"{config['schema']}"
-                            ),
-
-                            "outputTable": (
-                                f"{PROJECT_ID}:"
-                                f"ecommerce_bronze."
-                                f"{config['table']}"
-                            ),
-
-                            "bigQueryLoadingTemporaryDirectory": (
-                                f"gs://{DATA_BUCKET}/temp/"
-                            ),
-
-                            "badRecordsOutputTable": (
-                                f"{PROJECT_ID}:"
-                                f"ecommerce_bronze."
-                                f"{config['bad_table']}"
-                            ),
-
-                            "delimiter": ",",
-
-                            "csvFormat": "Default",
-
-                            "containsHeaders": "true",
-                        },
-                    }
+                    dataflow_job
                 )
+
+                print(
+                    f"NEW FILE: {file_path}"
+                )
+
+                print(
+                    f"DATAFLOW JOB: {job_name}"
+                )
+
+        # ----------------------------------------------------
+        # Summary
+        # ----------------------------------------------------
+
+        print(
+            "======================================"
+        )
 
         print(
             f"New files discovered: "
             f"{len(dataflow_jobs)}"
         )
 
+        print(
+            "======================================"
+        )
+
         for job in dataflow_jobs:
+
             print(
-                f"Dataflow job: "
-                f"{job['job_name']}"
+                f"Job: {job['job_name']}"
             )
 
             print(
-                f"Input: "
+                f"File: "
                 f"{job['parameters']['inputFilePattern']}"
             )
 
         # IMPORTANT:
-        # Return the LIST directly.
-        # Do NOT return {"dataflow": ...}
+        # Return the list directly.
+        # This allows Airflow dynamic task mapping.
         return dataflow_jobs
 
 
-    # ------------------------------------------------------
-    # Discover new files
-    # ------------------------------------------------------
+    # ========================================================
+    # RUN FILE DISCOVERY
+    # ========================================================
 
     new_files = check_new_files()
 
 
-    # ------------------------------------------------------
-    # Dynamically create one Dataflow task per file
-    # ------------------------------------------------------
+    # ========================================================
+    # 2. RUN DATAFLOW DYNAMICALLY
+    # ========================================================
 
     run_dataflow = (
         DataflowTemplatedJobStartOperator.partial(
+
             task_id="run_dataflow",
 
             project_id=PROJECT_ID,
@@ -231,16 +306,21 @@ with DAG(
 
             wait_until_finished=True,
         )
-        .expand_kwargs(new_files)
+
+        .expand_kwargs(
+            new_files
+        )
     )
 
 
-    # ------------------------------------------------------
-    # Record successful ingestion
-    # ------------------------------------------------------
+    # ========================================================
+    # 3. WRITE INGESTION AUDIT
+    # ========================================================
 
     @task
-    def record_ingestion_success(file_info):
+    def record_ingestion_success(
+        file_info
+    ):
 
         from google.cloud import storage
         from google.cloud import bigquery
@@ -253,9 +333,15 @@ with DAG(
             project=PROJECT_ID
         )
 
-        file_path = file_info[
+        # ----------------------------------------------------
+        # Extract information from Dataflow mapping
+        # ----------------------------------------------------
+
+        parameters = file_info[
             "parameters"
-        ][
+        ]
+
+        file_path = parameters[
             "inputFilePattern"
         ]
 
@@ -263,53 +349,79 @@ with DAG(
             "job_name"
         ]
 
-        # --------------------------------------------------
-        # Get GCS object metadata
-        # --------------------------------------------------
+        # ----------------------------------------------------
+        # Extract GCS object path
+        # ----------------------------------------------------
 
-        path_without_prefix = file_path[
+        bucket_prefix = (
             f"gs://{DATA_BUCKET}/"
-            .__len__():
+        )
+
+        object_name = file_path[
+            len(bucket_prefix):
         ]
 
-        blob = storage_client.bucket(
-            DATA_BUCKET
-        ).get_blob(
-            path_without_prefix
+        # ----------------------------------------------------
+        # Read GCS metadata
+        # ----------------------------------------------------
+
+        blob = (
+            storage_client
+            .bucket(DATA_BUCKET)
+            .get_blob(object_name)
         )
+
+        file_name = object_name.split(
+            "/"
+        )[-1]
 
         file_size = None
         file_generation = None
-        file_name = path_without_prefix.split("/")[-1]
 
         if blob:
+
             file_size = blob.size
+
             file_generation = str(
                 blob.generation
             )
 
-        now = datetime.now(
-            timezone.utc
-        ).isoformat()
+        # ----------------------------------------------------
+        # Identify entity
+        # ----------------------------------------------------
 
-        # --------------------------------------------------
-        # Determine entity
-        # --------------------------------------------------
+        entity_name = "unknown"
 
-        for entity, config in ENTITY_CONFIG.items():
+        for entity in ENTITY_CONFIG:
 
             if (
                 f"incoming/{entity}/"
-                in path_without_prefix
+                in object_name
             ):
-                entity_name = entity
-                break
-        else:
-            entity_name = "unknown"
 
-        # --------------------------------------------------
-        # Create audit record
-        # --------------------------------------------------
+                entity_name = entity
+
+                break
+
+        # ----------------------------------------------------
+        # Timestamps
+        # ----------------------------------------------------
+
+        started_at = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        completed_at = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        created_at = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        # ----------------------------------------------------
+        # Build audit record
+        # ----------------------------------------------------
 
         row = {
 
@@ -327,13 +439,13 @@ with DAG(
 
             "file_size_bytes": file_size,
 
-            "file_generation": file_generation,
+            "file_generation": (
+                file_generation
+            ),
 
-            "started_at": now,
+            "started_at": started_at,
 
-            "completed_at": datetime.now(
-                timezone.utc
-            ).isoformat(),
+            "completed_at": completed_at,
 
             "status": "SUCCESS",
 
@@ -345,30 +457,57 @@ with DAG(
 
             "error_message": None,
 
-            "created_at": datetime.now(
-                timezone.utc
-            ).isoformat(),
+            "created_at": created_at,
         }
+
+        # ----------------------------------------------------
+        # Insert audit record
+        # ----------------------------------------------------
 
         errors = bq_client.insert_rows_json(
             AUDIT_TABLE,
             [row],
+
             row_ids=[
                 row["audit_id"]
             ],
         )
 
         if errors:
+
             raise RuntimeError(
-                f"Failed to write ingestion "
+                "Failed to write ingestion "
                 f"audit: {errors}"
             )
 
         print(
-            f"SUCCESS audit recorded: "
-            f"{file_path}"
+            "======================================"
         )
 
+        print(
+            "INGESTION SUCCESS"
+        )
+
+        print(
+            f"File: {file_path}"
+        )
+
+        print(
+            f"Dataflow Job: {job_name}"
+        )
+
+        print(
+            f"Entity: {entity_name}"
+        )
+
+        print(
+            "======================================"
+        )
+
+
+    # ========================================================
+    # CREATE DYNAMIC AUDIT TASKS
+    # ========================================================
 
     record_success = (
         record_ingestion_success
@@ -378,8 +517,8 @@ with DAG(
     )
 
 
-    # ------------------------------------------------------
-    # Dependency
-    # ------------------------------------------------------
+    # ========================================================
+    # DEPENDENCY
+    # ========================================================
 
     run_dataflow >> record_success
