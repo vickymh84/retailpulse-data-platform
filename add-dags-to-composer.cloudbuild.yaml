@@ -13,3 +13,6 @@ steps:
       - utils/add_dags_to_composer.py
       - --dags_directory=${_DAGS_DIRECTORY}
       - --dags_bucket=${_DAGS_BUCKET}
+
+options:
+  logging: CLOUD_LOGGING_ONLY
