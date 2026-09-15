@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from airflow import DAG
+from airflow.decorators import task
 from airflow.providers.google.cloud.operators.dataflow import (
     DataflowTemplatedJobStartOperator,
 )
@@ -10,10 +11,13 @@ PROJECT_ID = "retailpulse-lab-poc"
 REGION = "asia-south1"
 
 DATA_BUCKET = "ecommerce-data-bt"
-TEMP_BUCKET = f"gs://{DATA_BUCKET}/temp"
+AUDIT_TABLE = (
+    f"{PROJECT_ID}.ecommerce_bronze.ingestion_audit"
+)
 
 DATAFLOW_TEMPLATE = (
-    f"gs://dataflow-templates-{REGION}/latest/GCS_CSV_to_BigQuery"
+    f"gs://dataflow-templates-{REGION}/latest/"
+    "GCS_CSV_to_BigQuery"
 )
 
 
@@ -25,114 +29,97 @@ with DAG(
     tags=["retailpulse", "batch", "dataflow"],
 ) as dag:
 
-    batch_users = DataflowTemplatedJobStartOperator(
-        task_id="batch_users",
-        project_id=PROJECT_ID,
-        location=REGION,
-        template=DATAFLOW_TEMPLATE,
-        job_name="retailpulse-users-{{ ts_nodash | lower }}",
-        wait_until_finished=True,
-        parameters={
-            "inputFilePattern": (
-                f"gs://{DATA_BUCKET}/incoming/users/*.csv"
-            ),
-            "schemaJSONPath": (
-                f"gs://{DATA_BUCKET}/schema/raw_users_schema.json"
-            ),
-            "outputTable": (
-                f"{PROJECT_ID}:ecommerce_bronze.raw_users"
-            ),
-            "bigQueryLoadingTemporaryDirectory": TEMP_BUCKET,
-            "badRecordsOutputTable": (
-                f"{PROJECT_ID}:ecommerce_bronze.bad_users"
-            ),
-            "delimiter": ",",
-            "csvFormat": "Default",
-            "containsHeaders": "true",
-            "csvFileEncoding": "UTF-8",
-        },
-    )
+    @task
+    def check_new_files():
+        """
+        Check GCS for CSV files that have not already
+        been successfully processed.
 
-    batch_products = DataflowTemplatedJobStartOperator(
-        task_id="batch_products",
-        project_id=PROJECT_ID,
-        location=REGION,
-        template=DATAFLOW_TEMPLATE,
-        job_name="retailpulse-products-{{ ts_nodash | lower }}",
-        wait_until_finished=True,
-        parameters={
-            "inputFilePattern": (
-                f"gs://{DATA_BUCKET}/incoming/products/*.csv"
-            ),
-            "schemaJSONPath": (
-                f"gs://{DATA_BUCKET}/schema/raw_products_schema.json"
-            ),
-            "outputTable": (
-                f"{PROJECT_ID}:ecommerce_bronze.raw_products"
-            ),
-            "bigQueryLoadingTemporaryDirectory": TEMP_BUCKET,
-            "badRecordsOutputTable": (
-                f"{PROJECT_ID}:ecommerce_bronze.bad_products"
-            ),
-            "delimiter": ",",
-            "csvFormat": "Default",
-            "containsHeaders": "true",
-            "csvFileEncoding": "UTF-8",
-        },
-    )
+        This is the first stage of file-level idempotency.
+        """
 
-    batch_orders = DataflowTemplatedJobStartOperator(
-        task_id="batch_orders",
-        project_id=PROJECT_ID,
-        location=REGION,
-        template=DATAFLOW_TEMPLATE,
-        job_name="retailpulse-orders-{{ ts_nodash | lower }}",
-        wait_until_finished=True,
-        parameters={
-            "inputFilePattern": (
-                f"gs://{DATA_BUCKET}/incoming/orders/*.csv"
-            ),
-            "schemaJSONPath": (
-                f"gs://{DATA_BUCKET}/schema/raw_orders_schema.json"
-            ),
-            "outputTable": (
-                f"{PROJECT_ID}:ecommerce_bronze.raw_orders"
-            ),
-            "bigQueryLoadingTemporaryDirectory": TEMP_BUCKET,
-            "badRecordsOutputTable": (
-                f"{PROJECT_ID}:ecommerce_bronze.bad_orders"
-            ),
-            "delimiter": ",",
-            "csvFormat": "Default",
-            "containsHeaders": "true",
-            "csvFileEncoding": "UTF-8",
-        },
-    )
+        from google.cloud import storage
+        from google.cloud import bigquery
 
-    batch_order_items = DataflowTemplatedJobStartOperator(
-        task_id="batch_order_items",
-        project_id=PROJECT_ID,
-        location=REGION,
-        template=DATAFLOW_TEMPLATE,
-        job_name="retailpulse-order-items-{{ ts_nodash | lower }}",
-        wait_until_finished=True,
-        parameters={
-            "inputFilePattern": (
-                f"gs://{DATA_BUCKET}/incoming/order_items/*.csv"
-            ),
-            "schemaJSONPath": (
-                f"gs://{DATA_BUCKET}/schema/raw_order_items_schema.json"
-            ),
-            "outputTable": (
-                f"{PROJECT_ID}:ecommerce_bronze.raw_order_items"
-            ),
-            "bigQueryLoadingTemporaryDirectory": TEMP_BUCKET,
-            "badRecordsOutputTable": (
-                f"{PROJECT_ID}:ecommerce_bronze.bad_order_items"
-            ),
-            "delimiter": ",",
-            "csvFormat": "Default",
-            "containsHeaders": "true",
-            "csvFileEncoding": "UTF-8",
-        },
-    )
+        storage_client = storage.Client(
+            project=PROJECT_ID
+        )
+
+        bq_client = bigquery.Client(
+            project=PROJECT_ID
+        )
+
+        bucket = storage_client.bucket(DATA_BUCKET)
+
+        query = f"""
+            SELECT DISTINCT file_path
+            FROM `{AUDIT_TABLE}`
+            WHERE status = 'SUCCESS'
+        """
+
+        processed_files = {
+            row.file_path
+            for row in bq_client.query(query).result()
+        }
+
+        entities = [
+            "users",
+            "products",
+            "orders",
+            "order_items",
+        ]
+
+        new_files = {}
+
+        for entity in entities:
+
+            prefix = f"incoming/{entity}/"
+
+            blobs = storage_client.list_blobs(
+                bucket,
+                prefix=prefix,
+            )
+
+            files = []
+
+            for blob in blobs:
+
+                if not blob.name.endswith(".csv"):
+                    continue
+
+                file_path = (
+                    f"gs://{DATA_BUCKET}/{blob.name}"
+                )
+
+                if file_path not in processed_files:
+                    files.append(file_path)
+
+            new_files[entity] = files
+
+        print(
+            f"New files discovered: {new_files}"
+        )
+
+        return new_files
+
+
+    new_files = check_new_files()
+
+
+    @task
+    def show_new_files(files):
+        """
+        Display discovered files in the Airflow logs.
+        """
+
+        print("Files selected for ingestion:")
+
+        for entity, paths in files.items():
+
+            print(f"\n{entity}:")
+
+            for path in paths:
+                print(f"  {path}")
+
+
+    show_files = show_new_files(new_files)
