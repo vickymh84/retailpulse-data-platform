@@ -15,7 +15,7 @@ from airflow.providers.google.cloud.operators.dataflow import (
 # ============================================================
 
 PROJECT_ID = "retailpulse-lab-poc"
-REGION = "asia-south1"
+REGION = "us-central1"
 
 DATA_BUCKET = "ecommerce-data-bt"
 
@@ -522,3 +522,5 @@ with DAG(
     # ========================================================
 
     run_dataflow >> record_success
+
+
